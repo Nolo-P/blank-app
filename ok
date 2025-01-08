@@ -1,0 +1,157 @@
+import streamlit as st
+from z3 import *
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# Médicaments et leurs caractéristiques
+medicaments = [
+    {"nom": "Paracétamol", "prix_unitaire": 2, "demande_min": 50, "stock_fournisseur": 100, "expiration": 30, "promotion": 10},
+    {"nom": "Ibuprofène", "prix_unitaire": 3, "demande_min": 30, "stock_fournisseur": 80, "expiration": 20, "promotion": 5},
+    {"nom": "Aspirine", "prix_unitaire": 1, "demande_min": 70, "stock_fournisseur": 120, "expiration": 15, "promotion": 0},
+]
+
+# Capacité maximale de stockage
+capacite_stock = 200
+
+# Interface utilisateur avec Streamlit
+st.title("Optimisation des commandes en pharmacie")
+st.sidebar.header("Paramètres")
+
+# Paramètres ajustables par l'utilisateur
+budget_max = st.sidebar.slider("Budget maximal (€)", min_value=50, max_value=500, value=300, step=10)
+priorite_expiration = st.sidebar.checkbox("Prioriser les médicaments proches de l'expiration ?", value=False)
+ajouter_promotions = st.sidebar.checkbox("Inclure les promotions ?", value=True)
+
+# Tableau pour enregistrer et comparer les scénarios
+if "scenarios" not in st.session_state:
+    st.session_state["scenarios"] = []
+
+# Résumé des données
+st.subheader("Données des médicaments")
+medicaments_df = pd.DataFrame(medicaments)
+st.write(medicaments_df)
+
+# Solveur Z3
+solver = Optimize()
+
+# Création des variables pour les quantités commandées
+quantites = [Int(m["nom"]) for m in medicaments]
+
+# Ajout des contraintes pour chaque médicament
+cout_total = Real("cout_total")
+satisfaction_totale = Real("satisfaction_totale")
+stock_utilise = Int("stock_utilise")
+
+solver.add(cout_total == 0)
+solver.add(satisfaction_totale == 0)
+solver.add(stock_utilise == 0)
+
+for i, med in enumerate(medicaments):
+    # Contrainte : La quantité commandée doit être comprise entre la demande minimale et le stock disponible
+    solver.add(quantites[i] >= med["demande_min"])
+    solver.add(quantites[i] <= med["stock_fournisseur"])
+
+    # Priorité pour les médicaments proches de l'expiration
+    poids = (1 / med["expiration"]) if priorite_expiration else 1
+
+    # Gestion des promotions
+    prix_effectif = med["prix_unitaire"]
+    if ajouter_promotions and med["promotion"] > 0:
+        prix_effectif -= prix_effectif * (med["promotion"] / 100)
+
+    # Calcul du coût, de la satisfaction et de l'utilisation du stockage
+    solver.add(cout_total == cout_total + quantites[i] * prix_effectif)
+    solver.add(satisfaction_totale == satisfaction_totale + quantites[i] * poids)
+    solver.add(stock_utilise == stock_utilise + quantites[i])
+
+# Contraintes supplémentaires
+solver.add(cout_total <= budget_max)  # Respect du budget
+solver.add(stock_utilise <= capacite_stock)  # Respect de la capacité de stockage
+
+# Objectif : Maximiser la satisfaction de la demande
+solver.maximize(satisfaction_totale)
+
+# Résolution
+if solver.check() == sat:
+    model = solver.model()
+    solutions = []
+    for i, med in enumerate(medicaments):
+        quantite = model.eval(quantites[i]).as_long()
+        solutions.append({
+            "Médicament": med["nom"],
+            "Quantité commandée": quantite,
+            "Prix unitaire (après promo)": round(med["prix_unitaire"] * (1 - med["promotion"] / 100), 2) if ajouter_promotions else med["prix_unitaire"],
+            "Coût total (€)": round(quantite * med["prix_unitaire"] * (1 - med["promotion"] / 100), 2) if ajouter_promotions else quantite * med["prix_unitaire"]
+        })
+    solutions_df = pd.DataFrame(solutions)
+
+    # Ajout des résultats au tableau de bord des scénarios
+    st.session_state["scenarios"].append({
+        "Budget": budget_max,
+        "Promotions": ajouter_promotions,
+        "Expiration priorisée": priorite_expiration,
+        "Coût total (€)": model.eval(cout_total).as_decimal(2),
+        "Stock utilisé": model.eval(stock_utilise),
+        "Résultats": solutions_df
+    })
+
+    # Affichage des résultats pour le scénario actuel
+    st.subheader("Résultats de l'optimisation")
+    st.write(solutions_df)
+    st.write(f"Coût total : {model.eval(cout_total).as_decimal(2)} €")
+    st.write(f"Stock utilisé : {model.eval(stock_utilise)} / {capacite_stock}")
+
+    # Visualisation des résultats
+    st.subheader("Visualisation des commandes")
+    plt.figure(figsize=(8, 5))
+    plt.bar(solutions_df["Médicament"], solutions_df["Quantité commandée"], color="skyblue")
+    plt.xlabel("Médicaments")
+    plt.ylabel("Quantités commandées")
+    plt.title("Quantités commandées par médicament")
+    st.pyplot(plt)
+
+else:
+    st.error("Pas de solution satisfaisante pour les contraintes données.")
+
+# Comparaison des scénarios
+st.subheader("Tableau de bord des scénarios")
+
+if st.session_state["scenarios"]:
+    scenarios_summary = []
+    # Construction des résumés des scénarios
+    for i, scenario in enumerate(st.session_state["scenarios"]):
+        try:
+            # Tente de convertir le coût total en float, sinon affiche une erreur
+            cout_total = float(str(scenario["Coût total"]).replace(",", ".").strip())
+        except ValueError:
+            cout_total = "Erreur"
+
+        scenarios_summary.append({
+            "Scénario": f"Scénario {i+1}",
+            "Budget (€)": scenario["Budget"],
+            "Promotions": "Oui" if scenario["Promotions"] else "Non",
+            "Expiration priorisée": "Oui" if scenario["Expiration priorisée"] else "Non",
+            "Coût total (€)": cout_total,
+            "Stock utilisé": scenario["Stock utilisé"]
+        })
+
+    # Création d'un DataFrame à partir des résumés
+    scenarios_df = pd.DataFrame(scenarios_summary)
+    st.write(scenarios_df)
+
+    # Sélection d'un scénario pour afficher les détails
+    scenario_index = st.selectbox(
+        "Sélectionnez un scénario pour voir les détails :",
+        range(len(st.session_state["scenarios"])),
+        format_func=lambda x: f"Scénario {x+1}"
+    )
+    selected_scenario = st.session_state["scenarios"][scenario_index]
+
+    # Affichage des détails du scénario sélectionné
+    st.write(f"**Détails du Scénario {scenario_index+1}**")
+    st.write(selected_scenario["Résultats"])
+else:
+    st.info("Aucun scénario enregistré pour l'instant.")
+
+!streamlit run pharmacie_optimisation.py 
+
